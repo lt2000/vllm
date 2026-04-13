@@ -67,8 +67,8 @@ from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         KVCacheSpec, MambaSpec,
                                         SegmentedFullAttentionSpec,
                                         SlidingWindowSpec)
-from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
-                             ModelRunnerOutput)
+from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, KVMemoryOpStatus,
+                             LogprobsTensors, ModelRunnerOutput)
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -354,6 +354,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.num_seg = 0
         self.num_blocks = 0
         self.seg_size_list: list[int] = []
+        self.kv_mem_op_status = KVMemoryOpStatus()
         self.total_memory = (
             torch.cuda.get_device_properties(self.device).total_memory
             if self.device.type == "cuda" else 0)
@@ -3435,10 +3436,34 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.num_seg += seg_delta
         return True
 
-    def _seg_manager(self, seg_delta: int, segment_size: int) -> bool:
+    def _refresh_kv_mem_op_status(self) -> None:
+        if self.kv_mem_op_status.state != "running":
+            return
+        if (self.elastic_allocator is None
+                or not self.elastic_allocator.is_batch_memory_op_running()):
+            self.kv_mem_op_status.state = "done"
+
+    def get_kv_mem_op_status(self) -> KVMemoryOpStatus:
+        self._refresh_kv_mem_op_status()
+        return KVMemoryOpStatus(op_id=self.kv_mem_op_status.op_id,
+                                state=self.kv_mem_op_status.state,
+                                error=self.kv_mem_op_status.error)
+
+    def _seg_manager(self,
+                     op_id: int,
+                     seg_delta: int,
+                     segment_size: int) -> bool:
         if seg_delta == 0:
             return True
-        return self.seg_manager_impl(seg_delta, segment_size)
+        result = self.seg_manager_impl(seg_delta, segment_size)
+        if seg_delta > 0:
+            state = "done"
+            if (self.elastic_allocator is not None
+                    and self.elastic_allocator.is_batch_memory_op_running()):
+                state = "running"
+            self.kv_mem_op_status = KVMemoryOpStatus(op_id=op_id,
+                                                     state=state)
+        return result
 
     def _build_encoder_only_attn_metadata(
             self, scheduler_output: "SchedulerOutput") -> \

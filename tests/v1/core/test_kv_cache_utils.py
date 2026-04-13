@@ -176,6 +176,31 @@ def test_get_kv_cache_config_uniform_type_dynamic_initial_blocks():
     assert kv_cache_config.num_blocks_per_seg == 8
 
 
+def test_get_kv_cache_config_uniform_type_dynamic_rejects_initial_blocks_above_profiled_max(
+):
+    cache_config = CacheConfig(block_size=16,
+                               enable_vmm_dynamic=True,
+                               num_blocks_per_seg=8,
+                               init_num_segs=3)
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(max_model_len=128),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
+    )
+    kv_cache_spec = {
+        "layer_1": new_segmented_kv_cache_spec(segment_size=8),
+        "layer_2": new_segmented_kv_cache_spec(segment_size=8),
+    }
+    page_size = next(iter(kv_cache_spec.values())).page_size_bytes
+    available_memory = page_size * 2 * 2
+
+    with pytest.raises(ValueError,
+                       match="Initial dynamic KV capacity .* exceeds "
+                       "profiled maximum KV capacity"):
+        _get_kv_cache_config_uniform_type(vllm_config, kv_cache_spec,
+                                          available_memory)
+
+
 def test_free_kv_cache_block_queue_initialization():
     # Test with a single block
     block = KVCacheBlock(block_id=0)

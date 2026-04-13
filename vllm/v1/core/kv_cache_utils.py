@@ -832,6 +832,14 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
                       vllm_config.cache_config.init_num_segs)
         max_num_blocks = get_num_blocks(vllm_config, len(kv_cache_spec),
                                         available_memory, page_size)
+        if num_blocks > max_num_blocks:
+            raise ValueError(
+                "Initial dynamic KV capacity "
+                f"({num_blocks} blocks = init_num_segs * num_blocks_per_seg) "
+                "exceeds profiled maximum KV capacity "
+                f"({max_num_blocks} blocks). "
+                "Reduce init_num_segs or num_blocks_per_seg, or increase "
+                "available KV cache memory.")
     else:
         num_blocks = get_num_blocks(vllm_config, len(kv_cache_spec),
                                     available_memory, page_size)

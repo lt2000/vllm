@@ -51,6 +51,12 @@ class BlockTable:
                                         dtype=torch.int64,
                                         device=self.device)
 
+    @staticmethod
+    def get_num_required_blocks(token_ids: list[int],
+                                block_size: int,
+                                num_lookahead_slots: int = 0) -> int:
+        return cdiv(len(token_ids) + num_lookahead_slots, block_size)
+
     def append_row(
         self,
         block_ids: list[int],

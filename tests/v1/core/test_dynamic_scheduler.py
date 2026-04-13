@@ -45,7 +45,16 @@ def test_scheduler_requests_segment_growth_when_usage_crosses_high_threshold():
     assert seg_delta == 1
     assert seg_size == 128
     sched._request_memory_from_mem_manager.assert_called_once_with(1)
-    sched.kv_cache_manager.add_segs.assert_called_once_with(1, 128)
+    sched.kv_cache_manager.add_segs.assert_not_called()
+
+
+def test_scheduler_commit_ready_kv_growth_adds_segments():
+    sched = Scheduler.__new__(Scheduler)
+    sched.kv_cache_manager = SimpleNamespace(add_segs=Mock())
+
+    Scheduler.commit_ready_kv_growth(sched, 2, 128)
+
+    sched.kv_cache_manager.add_segs.assert_called_once_with(2, 128)
 
 
 def test_scheduler_frees_only_trailing_empty_segments():

@@ -166,6 +166,7 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        self.pending_kv_growth = False
         if self.cache_config.enable_vmm_dynamic:
             self.mem_manager_client_id = (
                 self.vllm_config.model_config.mem_manager_client_id)
@@ -651,6 +652,8 @@ class Scheduler(SchedulerInterface):
 
     def _kv_cache_schedule(self) -> tuple[int, int]:
         seg_size = self.cache_config.num_blocks_per_seg
+        if getattr(self, "pending_kv_growth", False):
+            return 0, seg_size
         num_current_blocks = self.kv_cache_manager.get_num_blocks()
         num_free_blocks = self.kv_cache_manager.get_num_free_blocks()
         used_blocks = num_current_blocks - num_free_blocks
@@ -692,10 +695,10 @@ class Scheduler(SchedulerInterface):
                 actual_delta, actual_seg_size = (
                     self.kv_cache_manager.get_actual_segments(seg_delta))
                 if actual_delta > 0:
-                    logger.info("Growing KV cache by %d segment(s) of %d blocks",
-                                actual_delta, actual_seg_size)
-                    self.kv_cache_manager.add_segs(actual_delta,
-                                                  actual_seg_size)
+                    logger.info("Prepared KV cache growth of %d segment(s) of "
+                                "%d blocks; commit deferred until workers "
+                                "finish async mapping", actual_delta,
+                                actual_seg_size)
                 return actual_delta, seg_size
             return 0, seg_size
 
@@ -713,6 +716,16 @@ class Scheduler(SchedulerInterface):
             return seg_delta, seg_size
 
         return 0, seg_size
+
+    def set_pending_kv_growth(self, pending: bool) -> None:
+        self.pending_kv_growth = pending
+
+    def commit_ready_kv_growth(self, seg_delta: int, seg_size: int) -> None:
+        if seg_delta <= 0:
+            return
+        logger.info("Committing KV cache growth of %d segment(s) of %d blocks",
+                    seg_delta, seg_size)
+        self.kv_cache_manager.add_segs(seg_delta, seg_size)
 
     def _update_after_schedule(
         self,

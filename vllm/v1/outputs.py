@@ -78,6 +78,20 @@ class KVConnectorOutput:
     finished_recving: Optional[set[str]] = None
 
 
+@dataclass
+class KVMemoryOpStatus:
+    op_id: int = 0
+    state: str = "idle"
+    error: Optional[str] = None
+
+
+@dataclass
+class PendingKVGrowth:
+    op_id: int
+    seg_delta: int
+    seg_size: int
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -125,3 +139,9 @@ EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[],
                                               prompt_logprobs_dict={},
                                               pooler_output=[],
                                               num_nans_in_logits=None)
+
+
+@dataclass
+class WorkerExecutionResult:
+    model_output: Optional[ModelRunnerOutput]
+    kv_mem_op_status: KVMemoryOpStatus

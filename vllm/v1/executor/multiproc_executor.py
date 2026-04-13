@@ -33,7 +33,8 @@ from vllm.utils import (decorate_logs, get_distributed_init_method,
                         get_loopback_ip, get_mp_context, get_open_port,
                         set_process_title)
 from vllm.v1.executor.abstract import Executor, FailureCallback
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import (KVMemoryOpStatus, ModelRunnerOutput,
+                             WorkerExecutionResult)
 from vllm.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -126,6 +127,7 @@ class MultiprocExecutor(Executor):
         self.has_connector = self.vllm_config.kv_transfer_config is not None
         self.kv_output_aggregator = KVOutputAggregator(
             self.parallel_config.world_size)
+        self._ensure_dynamic_kv_state()
 
     def start_worker_monitor(self):
         workers = self.workers
@@ -168,10 +170,19 @@ class MultiprocExecutor(Executor):
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
         non_block = self.max_concurrent_batches > 1
         if self.vllm_config.cache_config.enable_vmm_dynamic:
-            self.collective_rpc("seg_manager",
-                                args=(scheduler_output.num_new_segs,
-                                      scheduler_output.num_block_per_seg),
-                                non_block=False)
+            self._maybe_dispatch_dynamic_kv_growth(
+                scheduler_output.num_new_segs, scheduler_output.num_block_per_seg)
+            worker_results = self.collective_rpc(
+                "execute_model_with_kv_status",
+                args=(scheduler_output, self.output_rank, self.has_connector),
+                non_block=non_block,
+                timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            )
+            if non_block:
+                assert self.io_thread_pool is not None
+                return self.io_thread_pool.submit(
+                    self._resolve_worker_execution_results, worker_results)
+            return self._resolve_worker_execution_results(worker_results)
 
         if not self.has_connector:
             # get output only from a single worker (output_rank)
@@ -195,6 +206,30 @@ class MultiprocExecutor(Executor):
             return self.kv_output_aggregator.async_aggregate(
                 outputs, self.output_rank)
         return self.kv_output_aggregator.aggregate(outputs, self.output_rank)
+
+    def _resolve_worker_execution_results(
+            self, worker_results: list[Union[WorkerExecutionResult,
+                                             Future]]) -> ModelRunnerOutput:
+        resolved_results = [
+            result.result() if isinstance(result, Future) else result
+            for result in worker_results
+        ]
+        statuses = [
+            result.kv_mem_op_status for result in resolved_results
+            if isinstance(result, WorkerExecutionResult)
+        ]
+        self._update_pending_kv_growth_status(
+            cast(list[KVMemoryOpStatus], statuses))
+        if not self.has_connector:
+            output = resolved_results[self.output_rank].model_output
+            assert output is not None
+            return output
+        outputs = [
+            result.model_output for result in resolved_results
+            if result.model_output is not None
+        ]
+        return self.kv_output_aggregator.aggregate(
+            cast(list[ModelRunnerOutput], outputs), self.output_rank)
 
     def collective_rpc(self,
                        method: Union[str, Callable],

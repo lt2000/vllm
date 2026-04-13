@@ -273,6 +273,14 @@ class EngineCore:
                                   self.scheduler.make_stats())
             raise err
 
+    def _commit_ready_kv_growth(self) -> None:
+        ready_growth = self.model_executor.take_ready_kv_growth()
+        if ready_growth is None:
+            return
+        self.scheduler.commit_ready_kv_growth(ready_growth.seg_delta,
+                                              ready_growth.seg_size)
+        self.scheduler.set_pending_kv_growth(False)
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -284,10 +292,13 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        self._commit_ready_kv_growth()
         scheduler_output = self.scheduler.schedule()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
+        if self.model_executor.has_pending_kv_growth():
+            self.scheduler.set_pending_kv_growth(True)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
 
@@ -317,9 +328,12 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         if not self.batch_queue.full():
+            self._commit_ready_kv_growth()
             scheduler_output = self.scheduler.schedule()
             if scheduler_output.total_num_scheduled_tokens > 0:
                 future = self.model_executor.execute_model(scheduler_output)
+                if self.model_executor.has_pending_kv_growth():
+                    self.scheduler.set_pending_kv_growth(True)
                 self.batch_queue.put_nowait(
                     (future, scheduler_output))  # type: ignore
 

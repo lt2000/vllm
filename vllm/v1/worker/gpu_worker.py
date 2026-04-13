@@ -28,7 +28,8 @@ from vllm.tasks import SupportedTask
 from vllm.utils import GiB_bytes, MemorySnapshot, memory_profiling
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput,
+                             WorkerExecutionResult)
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
@@ -386,8 +387,23 @@ class Worker(WorkerBase):
         assert isinstance(output, ModelRunnerOutput)
         return output
 
-    def seg_manager(self, seg_delta: int, segment_size: int) -> bool:
-        return self.model_runner._seg_manager(seg_delta, segment_size)
+    @torch.inference_mode()
+    def execute_model_with_kv_status(
+        self,
+        scheduler_output: "SchedulerOutput",
+        output_rank: int,
+        collect_all_outputs: bool = False,
+    ) -> WorkerExecutionResult:
+        model_output = self.execute_model(scheduler_output)
+        if not collect_all_outputs and self.rank != output_rank:
+            model_output = None
+        return WorkerExecutionResult(
+            model_output=model_output,
+            kv_mem_op_status=self.model_runner.get_kv_mem_op_status(),
+        )
+
+    def seg_manager(self, op_id: int, seg_delta: int, segment_size: int) -> bool:
+        return self.model_runner._seg_manager(op_id, seg_delta, segment_size)
 
     def profile(self, is_start: bool = True):
         if self.profiler is None:
