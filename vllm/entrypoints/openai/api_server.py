@@ -69,7 +69,9 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               RerankRequest, RerankResponse,
                                               ResponsesRequest,
                                               ResponsesResponse, ScoreRequest,
-                                              ScoreResponse, TokenizeRequest,
+                                              ScoreResponse, SMControlRequest,
+                                              SMControlResponse,
+                                              TokenizeRequest,
                                               TokenizeResponse,
                                               TranscriptionRequest,
                                               TranscriptionResponse,
@@ -574,6 +576,65 @@ async def show_available_models(raw_request: Request):
 async def show_version():
     ver = {"version": VLLM_VERSION}
     return JSONResponse(content=ver)
+
+
+@router.get("/v1/sm_control",
+            responses={
+                HTTPStatus.OK.value: {
+                    "model": SMControlResponse
+                },
+                HTTPStatus.NOT_IMPLEMENTED.value: {
+                    "model": ErrorResponse
+                },
+                HTTPStatus.INTERNAL_SERVER_ERROR.value: {
+                    "model": ErrorResponse
+                },
+            })
+async def get_sm_control(raw_request: Request):
+    engine = engine_client(raw_request)
+    getter = getattr(engine, "get_sm_control_state", None)
+    if getter is None:
+        raise HTTPException(status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+                            detail="SM control is not supported by this engine.")
+    try:
+        result = await getter()
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
+    return JSONResponse(content=SMControlResponse(**result).model_dump())
+
+
+@router.post("/v1/sm_control",
+             dependencies=[Depends(validate_json_request)],
+             responses={
+                 HTTPStatus.OK.value: {
+                     "model": SMControlResponse
+                 },
+                 HTTPStatus.NOT_IMPLEMENTED.value: {
+                     "model": ErrorResponse
+                 },
+                 HTTPStatus.BAD_REQUEST.value: {
+                     "model": ErrorResponse
+                 },
+                 HTTPStatus.INTERNAL_SERVER_ERROR.value: {
+                     "model": ErrorResponse
+                 },
+             })
+async def set_sm_control(request: SMControlRequest, raw_request: Request):
+    engine = engine_client(raw_request)
+    setter = getattr(engine, "set_sm_control_percentage", None)
+    if setter is None:
+        raise HTTPException(status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+                            detail="SM control is not supported by this engine.")
+    try:
+        result = await setter(request.percentage)
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                            detail=str(e)) from e
+    return JSONResponse(content=SMControlResponse(**result).model_dump())
 
 
 @router.post("/v1/responses",

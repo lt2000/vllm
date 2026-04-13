@@ -15,6 +15,8 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.smctrl_cudagraph import (SMControlCUDAGraph,
+                                   smctrl_cudagraph_enabled)
 from vllm.utils import weak_ref_tensors
 
 logger = init_logger(__name__)
@@ -140,7 +142,10 @@ class CUDAGraphWrapper:
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
-            cudagraph = torch.cuda.CUDAGraph()
+            if smctrl_cudagraph_enabled():
+                cudagraph = SMControlCUDAGraph(pool=self.graph_pool)
+            else:
+                cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -155,17 +160,23 @@ class CUDAGraphWrapper:
                         patch("torch.cuda.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(cudagraph, pool=self.graph_pool):
-                    # `output` is managed by pytorch's cudagraph pool
-                    output = self.runnable(*args, **kwargs)
-                    if self.cudagraph_options.weak_ref_output:
-                        # by converting it to weak ref,
-                        # the original `output` will immediately be released
-                        # to save memory. It is only safe to do this for
-                        # the last graph in piecewise cuadgraph mode, because
-                        # the output of the last graph will not be used by
-                        # any other cuda graph.
-                        output = weak_ref_tensors(output)
+                if smctrl_cudagraph_enabled():
+                    with cudagraph.capture():
+                        output = self.runnable(*args, **kwargs)
+                        if self.cudagraph_options.weak_ref_output:
+                            output = weak_ref_tensors(output)
+                else:
+                    with torch.cuda.graph(cudagraph, pool=self.graph_pool):
+                        # `output` is managed by pytorch's cudagraph pool
+                        output = self.runnable(*args, **kwargs)
+                        if self.cudagraph_options.weak_ref_output:
+                            # by converting it to weak ref,
+                            # the original `output` will immediately be released
+                            # to save memory. It is only safe to do this for
+                            # the last graph in piecewise cuadgraph mode, because
+                            # the output of the last graph will not be used by
+                            # any other cuda graph.
+                            output = weak_ref_tensors(output)
 
             # here we always use weak ref for the output
             # to save memory

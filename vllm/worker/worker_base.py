@@ -129,6 +129,14 @@ class WorkerBase:
         """Get vocabulary size from model configuration."""
         return self.model_config.get_vocab_size()
 
+    def set_sm_control_percentage(self, percentage: float) -> dict[str, Any]:
+        from vllm.smctrl_cudagraph import set_smctrl_cudagraph_percentage
+        return set_smctrl_cudagraph_percentage(percentage)
+
+    def get_sm_control_state(self) -> dict[str, Any]:
+        from vllm.smctrl_cudagraph import get_smctrl_cudagraph_state
+        return get_smctrl_cudagraph_state()
+
 
 class DelegateWorkerBase(WorkerBase):
     """

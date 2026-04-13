@@ -615,6 +615,34 @@ class AsyncLLM(EngineClient):
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs)
 
+    async def set_sm_control_percentage(self,
+                                        percentage: float) -> dict[str, Any]:
+        results = await self.collective_rpc("set_sm_control_percentage",
+                                            args=(percentage, ))
+        if not results:
+            raise RuntimeError("No worker responded to set_sm_control_percentage")
+        first = dict(results[0])
+        first["worker_results"] = list(results)
+        first["worker_count"] = len(results)
+        first["consistent"] = all(
+            r.get("mask") == first["mask"]
+            and r.get("enabled_tpcs") == first["enabled_tpcs"]
+            and r.get("total_tpcs") == first["total_tpcs"] for r in results)
+        return first
+
+    async def get_sm_control_state(self) -> dict[str, Any]:
+        results = await self.collective_rpc("get_sm_control_state")
+        if not results:
+            raise RuntimeError("No worker responded to get_sm_control_state")
+        first = dict(results[0])
+        first["worker_results"] = list(results)
+        first["worker_count"] = len(results)
+        first["consistent"] = all(
+            r.get("mask") == first["mask"]
+            and r.get("enabled_tpcs") == first["enabled_tpcs"]
+            and r.get("total_tpcs") == first["total_tpcs"] for r in results)
+        return first
+
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
         start_time = time.time()

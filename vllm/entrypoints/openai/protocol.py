@@ -144,6 +144,24 @@ class RequestResponseMetadata(BaseModel):
     final_usage_info: Optional[UsageInfo] = None
 
 
+class SMControlRequest(OpenAIBaseModel):
+    percentage: float = Field(..., gt=0.0, le=100.0)
+
+
+class SMControlResponse(OpenAIBaseModel):
+    requested_percentage: Optional[float] = None
+    effective_percentage: float
+    total_tpcs: int
+    enabled_tpcs: int
+    mask: str
+    mask_int: int
+    strategy: str
+    device_index: int
+    worker_count: int = 0
+    consistent: bool = True
+    worker_results: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class JsonSchemaResponseFormat(OpenAIBaseModel):
     name: str
     description: Optional[str] = None

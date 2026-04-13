@@ -26,6 +26,7 @@ from vllm.sequence import (ExecuteModelRequest, IntermediateTensors,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta)
 from vllm.utils import (GiB_bytes, MemorySnapshot, bind_kv_cache,
                         memory_profiling)
+from vllm.smctrl_cudagraph import initialize_smctrl_for_current_device
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
 from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
@@ -187,6 +188,7 @@ class Worker(LocalOrDistributedWorkerBase):
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             self.baseline_snapshot = MemorySnapshot()
+            initialize_smctrl_for_current_device(self.device.index)
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
