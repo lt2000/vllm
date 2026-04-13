@@ -87,6 +87,29 @@ vLLM seamlessly supports most popular open-source models on HuggingFace, includi
 
 Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
 
+## Fork Notes
+
+This repository is a fork of upstream vLLM with `libsmctrl` integration for
+runtime SM reconfiguration under CUDA Graph replay.
+
+Paired repository:
+
+- `https://github.com/lt2000/libsmctrl`
+
+Main integration branch in this fork:
+
+- `smctrl-v0.10.1`
+
+What this fork adds on top of upstream `v0.10.1`:
+
+- `vllm.smctrl_cudagraph.SMControlCUDAGraph`
+- `CUDAGraphWrapper` hook to use `SMControlCUDAGraph`
+- worker and engine RPCs for SM reconfiguration
+- `GET /v1/sm_control`
+- `POST /v1/sm_control`
+- tensor-parallel-compatible runtime SM control
+- a tokenizer compatibility fallback used by the validated environment
+
 ## Getting Started
 
 Install vLLM with `pip` or [from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source):
@@ -100,6 +123,58 @@ Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
 - [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
 - [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
 - [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+
+## Install This Fork with libsmctrl
+
+This fork is intended to be used together with the paired `libsmctrl`
+repository, built as a shared library.
+
+Minimal setup:
+
+1. Build `libsmctrl.so` from `https://github.com/lt2000/libsmctrl`.
+2. Install this fork from source in a dedicated environment.
+
+Example:
+
+```bash
+git clone git@github.com:lt2000/libsmctrl.git
+cd libsmctrl
+make libsmctrl.so
+
+git clone git@github.com:lt2000/vllm.git
+cd vllm
+git switch smctrl-v0.10.1
+pip install -e .
+```
+
+To enable the SM-control CUDA Graph path at runtime:
+
+```bash
+export VLLM_SMCTRL_CUDAGRAPH_ENABLE=1
+export VLLM_SMCTRL_LIBSMCTRL_SO_PATH=/path/to/libsmctrl/libsmctrl.so
+```
+
+Example serving command:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5 \
+VLLM_USE_V1=1 \
+VLLM_SMCTRL_CUDAGRAPH_ENABLE=1 \
+VLLM_SMCTRL_LIBSMCTRL_SO_PATH=/path/to/libsmctrl/libsmctrl.so \
+vllm serve /path/to/model \
+  --port 10021 \
+  --tensor-parallel-size 2
+```
+
+Then query or update the SM state with:
+
+```bash
+curl -s http://127.0.0.1:10021/v1/sm_control
+
+curl -s http://127.0.0.1:10021/v1/sm_control \
+  -H 'Content-Type: application/json' \
+  -d '{"percentage": 50.0}'
+```
 
 ## Contributing
 
