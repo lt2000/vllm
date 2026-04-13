@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -838,3 +840,38 @@ def test_hybrid_attention_mamba_tensor_shapes(monkeypatch):
                                conv_blocks_constant)
             assert torch.equal(vllm_ctx[layer].kv_cache[0][1][blocks1, :],
                                ssm_blocks_constant)
+
+
+def test_block_get_offset_and_aligned_size_is_monotonic():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+
+    off1, size1 = runner.block_get_offset_and_aligned_size((16, 8, 128),
+                                                           torch.int8, 128, 0)
+    off2, size2 = runner.block_get_offset_and_aligned_size((16, 8, 128),
+                                                           torch.int8, 128,
+                                                           128)
+
+    assert off1 == 0
+    assert off2 >= off1 + size1 * (2 * 1024 * 1024)
+    assert size2 >= 0
+
+
+def test_seg_manager_impl_updates_block_accounting():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.elastic_allocator = SimpleNamespace(batch_allocate_async=Mock(),
+                                               batch_free_async=Mock())
+    runner.kv_cache_config = SimpleNamespace(is_vmm_dynamic=True)
+    runner.cache_config = SimpleNamespace(enable_vmm_dynamic=True)
+    runner.kv_cache_shape = (0, 0, 16, 8, 128)
+    runner.dtype = torch.int8
+    runner.num_seg = 0
+    runner.num_blocks = 0
+    runner.seg_size_list = []
+
+    result = runner.seg_manager_impl(1, 128)
+
+    assert result is True
+    assert runner.num_seg == 1
+    assert runner.num_blocks == 128
+    assert runner.seg_size_list == [128]
+    runner.elastic_allocator.batch_allocate_async.assert_called_once()

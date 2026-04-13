@@ -386,6 +386,9 @@ class Worker(WorkerBase):
         assert isinstance(output, ModelRunnerOutput)
         return output
 
+    def seg_manager(self, seg_delta: int, segment_size: int) -> bool:
+        return self.model_runner._seg_manager(seg_delta, segment_size)
+
     def profile(self, is_start: bool = True):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")

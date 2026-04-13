@@ -29,8 +29,19 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
-                                    enable_kv_cache_events)
+        if kv_cache_config.is_vmm_dynamic:
+            self.block_pool = BlockPool(
+                kv_cache_config.num_blocks,
+                enable_caching,
+                enable_kv_cache_events,
+                num_segments=1,
+                segment_sizes=[kv_cache_config.num_blocks],
+                num_max_gpu_blocks=kv_cache_config.max_num_blocks,
+            )
+        else:
+            self.block_pool = BlockPool(kv_cache_config.num_blocks,
+                                        enable_caching,
+                                        enable_kv_cache_events)
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
@@ -39,6 +50,8 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 block_pool=self.block_pool,
                 kv_cache_group_id=i,
+                num_segments=1,
+                segment_sizes=[kv_cache_config.num_blocks],
             ) for i, kv_cache_group in enumerate(
                 self.kv_cache_config.kv_cache_groups))
 
@@ -161,6 +174,30 @@ class KVCacheCoordinator(ABC):
         return tuple(
             manager.req_to_blocks.get(request_id) or []
             for manager in self.single_type_managers)
+
+    def get_num_segs(self) -> int:
+        if not self.single_type_managers:
+            return 0
+        manager = self.single_type_managers[0]
+        return manager.get_num_segs() if hasattr(manager, "get_num_segs") else 1
+
+    def add_segs(self, num_segs: int, seg_size: int) -> None:
+        for manager in self.single_type_managers:
+            if hasattr(manager, "add_segs"):
+                manager.add_segs(num_segs, seg_size)
+
+    def remove_segs(self, num_segs: int) -> None:
+        for manager in self.single_type_managers:
+            if hasattr(manager, "remove_segs"):
+                manager.remove_segs(num_segs)
+
+    def select_free_segs(self, need_free_blocks: int) -> tuple[list[int], int]:
+        if not self.single_type_managers:
+            return [], 0
+        manager = self.single_type_managers[0]
+        if not hasattr(manager, "select_free_segs"):
+            return [], 0
+        return manager.select_free_segs(need_free_blocks)
 
     @abstractmethod
     def find_longest_cache_hit(

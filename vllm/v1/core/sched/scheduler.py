@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import itertools
+import pickle
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -34,6 +35,11 @@ from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.utils import LayerBlockType
+
+MB = 1024 * 1024
+MANAGER_MQ_BASE = 300
+REPLY_MQ_BASE = 1300
 
 logger = init_logger(__name__)
 
@@ -160,6 +166,13 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        if self.cache_config.enable_vmm_dynamic:
+            self.mem_manager_client_id = (
+                self.vllm_config.model_config.mem_manager_client_id)
+            self._manager_mq = None
+            self._reply_mq = None
+            kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+            self.block_size_in_bytes = kv_cache_spec.page_size_bytes // 2
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -558,6 +571,11 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens,
             req_to_new_block_ids,
         )
+        seg_delta = 0
+        seg_size = 0
+        if self.cache_config.enable_vmm_dynamic:
+            seg_delta, seg_size = self._kv_cache_schedule()
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -574,6 +592,8 @@ class Scheduler(SchedulerInterface):
             free_encoder_input_ids=self.encoder_cache_manager.get_freed_ids(),
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
+            num_new_segs=seg_delta,
+            num_block_per_seg=seg_size,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -591,6 +611,108 @@ class Scheduler(SchedulerInterface):
 
         self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _init_mem_manager_queues(self) -> None:
+        if self._manager_mq is not None and self._reply_mq is not None:
+            return
+        import sysv_ipc
+        self._manager_mq = sysv_ipc.MessageQueue(
+            MANAGER_MQ_BASE - self.mem_manager_client_id, sysv_ipc.IPC_CREAT)
+        self._reply_mq = sysv_ipc.MessageQueue(
+            REPLY_MQ_BASE + self.mem_manager_client_id, sysv_ipc.IPC_CREAT)
+
+    def _request_memory_from_mem_manager(self, seg_delta: int) -> int:
+        assert seg_delta > 0
+        self._init_mem_manager_queues()
+        import sysv_ipc
+        num_layers = self.vllm_config.model_config.get_num_layers_by_block_type(
+            self.parallel_config, LayerBlockType.attention)
+        seg_size_in_mb = (
+            self.block_size_in_bytes * self.cache_config.num_blocks_per_seg * 2
+            * num_layers) / MB
+        request = {
+            "client_id": self.mem_manager_client_id,
+            "req_mem": seg_delta * seg_size_in_mb,
+        }
+        logger.info("Requesting %d KV segment(s) from mem_manager %d (%.2f MiB)",
+                    seg_delta, self.mem_manager_client_id,
+                    seg_delta * seg_size_in_mb)
+        self._manager_mq.send(pickle.dumps(request))
+        while True:
+            try:
+                response_pkl, _ = self._reply_mq.receive(block=False)
+                break
+            except sysv_ipc.BusyError:
+                time.sleep(0.01)
+        response = pickle.loads(response_pkl)
+        logger.info("mem_manager %d replied: %s", self.mem_manager_client_id,
+                    response)
+        return seg_delta if response.get("res") == "yes" else 0
+
+    def _kv_cache_schedule(self) -> tuple[int, int]:
+        seg_size = self.cache_config.num_blocks_per_seg
+        num_current_blocks = self.kv_cache_manager.get_num_blocks()
+        num_free_blocks = self.kv_cache_manager.get_num_free_blocks()
+        used_blocks = num_current_blocks - num_free_blocks
+        pending_blocks = 0
+        if self.waiting:
+            from vllm.v1.worker.block_table import BlockTable
+            pending_blocks = sum(
+                BlockTable.get_num_required_blocks(
+                    seq.all_token_ids,
+                    block_size=self.cache_config.block_size,
+                    num_lookahead_slots=0,
+                ) for seq in self.waiting)
+
+        usage = self.kv_cache_manager.usage
+        if (usage > self.cache_config.gpu_cache_high_threshold
+                or pending_blocks > num_free_blocks):
+            need_alloc_blocks = (
+                int((used_blocks + pending_blocks) /
+                    self.cache_config.gpu_cache_high_threshold) -
+                num_current_blocks)
+            need_alloc_segs = max(0,
+                                  (need_alloc_blocks + seg_size - 1) //
+                                  seg_size)
+            configured_max_blocks = getattr(self.cache_config,
+                                            "max_gpu_blocks", 0)
+            runtime_max_blocks = (
+                self.kv_cache_manager.get_num_total_gpu_blocks()
+                if hasattr(self.kv_cache_manager, "get_num_total_gpu_blocks")
+                else num_current_blocks + seg_size * max(need_alloc_segs, 1))
+            max_total_blocks = (
+                configured_max_blocks
+                if configured_max_blocks > 0 else runtime_max_blocks)
+            can_allocate_segs = max(0,
+                                    (max_total_blocks - num_current_blocks) //
+                                    seg_size)
+            seg_delta = min(need_alloc_segs, can_allocate_segs)
+            if seg_delta > 0:
+                seg_delta = self._request_memory_from_mem_manager(seg_delta)
+                actual_delta, actual_seg_size = (
+                    self.kv_cache_manager.get_actual_segments(seg_delta))
+                if actual_delta > 0:
+                    logger.info("Growing KV cache by %d segment(s) of %d blocks",
+                                actual_delta, actual_seg_size)
+                    self.kv_cache_manager.add_segs(actual_delta,
+                                                  actual_seg_size)
+                return actual_delta, seg_size
+            return 0, seg_size
+
+        if usage < self.cache_config.gpu_cache_low_threshold:
+            need_free_blocks = (
+                num_current_blocks -
+                int(used_blocks / self.cache_config.gpu_cache_low_threshold))
+            free_seg_list, _ = self.kv_cache_manager.select_free_segs(
+                need_free_blocks)
+            seg_delta = -len(free_seg_list)
+            if seg_delta < 0:
+                logger.info("Shrinking KV cache by %d trailing segment(s)",
+                            -seg_delta)
+                self.kv_cache_manager.remove_segs(-seg_delta)
+            return seg_delta, seg_size
+
+        return 0, seg_size
 
     def _update_after_schedule(
         self,

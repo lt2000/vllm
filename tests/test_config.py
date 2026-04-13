@@ -6,8 +6,8 @@ from dataclasses import MISSING, Field, asdict, dataclass, field
 import pytest
 
 from vllm.compilation.backends import VllmBackend
-from vllm.config import (LoadConfig, ModelConfig, PoolerConfig, VllmConfig,
-                         get_field, update_config)
+from vllm.config import (CacheConfig, LoadConfig, ModelConfig, PoolerConfig,
+                         VllmConfig, get_field, update_config)
 from vllm.model_executor.layers.pooler import PoolingType
 from vllm.platforms import current_platform
 
@@ -72,6 +72,22 @@ def test_update_config():
     # Nested update with invalid type
     with pytest.raises(AssertionError):
         new_config3 = update_config(config3, {"a": "new_value"})
+
+
+def test_dynamic_kv_cache_config_validation():
+    with pytest.raises(ValueError,
+                       match="num_blocks_per_seg must be > 0"):
+        CacheConfig(enable_vmm_dynamic=True, num_blocks_per_seg=0)
+
+    with pytest.raises(ValueError,
+                       match="init_num_segs must be > 0"):
+        CacheConfig(enable_vmm_dynamic=True, init_num_segs=0)
+
+    with pytest.raises(ValueError,
+                       match="Require 0 < low < high < 1"):
+        CacheConfig(enable_vmm_dynamic=True,
+                    gpu_cache_high_threshold=0.7,
+                    gpu_cache_low_threshold=0.8)
 
 
 # Can remove once --task option is fully deprecated

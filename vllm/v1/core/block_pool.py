@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable
 from typing import Optional
 
@@ -33,18 +33,30 @@ class BlockPool:
         num_gpu_blocks: int,
         enable_caching: bool,
         enable_kv_cache_events: bool = False,
+        num_segments: int = 1,
+        segment_sizes: Optional[list[int]] = None,
+        num_max_gpu_blocks: Optional[int] = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+        if segment_sizes is not None:
+            assert sum(segment_sizes) == num_gpu_blocks, (
+                "The sum of segment_sizes must equal num_gpu_blocks.")
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
+        self.num_segments = num_segments
+        self.num_max_gpu_blocks = (num_max_gpu_blocks
+                                   if num_max_gpu_blocks is not None else
+                                   num_gpu_blocks)
+        self.use_segment = self.num_max_gpu_blocks > num_gpu_blocks
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
-            KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+            KVCacheBlock(idx) for idx in range(self.num_max_gpu_blocks)
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue = FreeKVCacheBlockQueue(
+            self.blocks[:num_gpu_blocks])
 
         # {block_hash: {block ID: block}}. A cached block is
         # a full block with a block hash that can be used for prefix caching.
@@ -66,6 +78,19 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
+        self.free_blocks_in_segments: list[deque[KVCacheBlock]] = [
+            deque() for _ in range(self.num_segments)
+        ]
+        if segment_sizes is None:
+            segment_sizes = [num_gpu_blocks]
+        block_id = 0
+        for seg_id, segment_size in enumerate(segment_sizes):
+            for _ in range(segment_size):
+                block = self.blocks[block_id]
+                block.segment_id = seg_id
+                if block is not self.null_block:
+                    self.free_blocks_in_segments[seg_id].append(block)
+                block_id += 1
 
     def get_cached_block(
             self, block_hash: BlockHash,
@@ -158,7 +183,9 @@ class BlockPool:
                     if request.lora_request else None,
                 ))
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(self,
+                       num_blocks: int,
+                       use_segment: bool = False) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
@@ -173,7 +200,23 @@ class BlockPool:
             raise ValueError(
                 f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if use_segment and self.use_segment:
+            ret: list[KVCacheBlock] = []
+            for seg_blocks in self.free_blocks_in_segments:
+                while seg_blocks and len(ret) < num_blocks:
+                    block = seg_blocks.popleft()
+                    try:
+                        self.free_block_queue.remove(block)
+                    except ValueError:
+                        pass
+                    ret.append(block)
+                if len(ret) == num_blocks:
+                    break
+            if len(ret) < num_blocks:
+                raise ValueError(
+                    f"Cannot get {num_blocks} free blocks from the pool")
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -235,9 +278,17 @@ class BlockPool:
                 # candidate), so remove it.
                 if block.ref_cnt == 0 and not block.is_null:
                     self.free_block_queue.remove(block)
+                    if self.use_segment and block.segment_id is not None:
+                        try:
+                            self.free_blocks_in_segments[
+                                block.segment_id].remove(block)
+                        except ValueError:
+                            pass
                 block.ref_cnt += 1
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(self,
+                    ordered_blocks: Iterable[KVCacheBlock],
+                    use_segment: bool = False) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
@@ -249,10 +300,46 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
+        if self.use_segment and use_segment:
+            for block in blocks_list:
+                if (block.ref_cnt == 0 and not block.is_null
+                        and block.segment_id is not None):
+                    self.free_blocks_in_segments[block.segment_id].append(
+                        block)
         self.free_block_queue.append_n([
             block for block in blocks_list
             if block.ref_cnt == 0 and not block.is_null
         ])
+
+    def add_segment(self, new_segment_id: int, segment_size: int) -> None:
+        assert self.use_segment, "BlockPool is not using segments."
+        assert new_segment_id == self.num_segments, (
+            "New segment id should equal the current number of segments.")
+        self.num_segments += 1
+        self.free_blocks_in_segments.append(deque())
+        start_block_id = self.num_gpu_blocks
+        self.num_gpu_blocks += segment_size
+        for block_id in range(start_block_id, start_block_id + segment_size):
+            block = self.blocks[block_id]
+            block.segment_id = new_segment_id
+            self.free_block_queue.append(block)
+            self.free_blocks_in_segments[new_segment_id].append(block)
+
+    def remove_segment(self, segment_id: int, segment_size: int) -> None:
+        assert self.use_segment, "BlockPool is not using segments."
+        assert segment_id == self.num_segments - 1, (
+            "Only the trailing segment can be removed.")
+        self.num_segments -= 1
+        self.num_gpu_blocks -= segment_size
+        self.free_blocks_in_segments.pop()
+        for block_id in range(self.num_gpu_blocks,
+                              self.num_gpu_blocks + segment_size):
+            block = self.blocks[block_id]
+            block.segment_id = None
+            try:
+                self.free_block_queue.remove(block)
+            except ValueError:
+                pass
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -299,6 +386,12 @@ class BlockPool:
             The KV cache usage (between 0.0 and 1.0).
         """
         return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
+
+    def get_num_blocks(self) -> int:
+        return self.num_gpu_blocks
+
+    def get_num_total_gpu_blocks(self) -> int:
+        return self.num_max_gpu_blocks
 
     def take_events(self) -> list[KVCacheEvent]:
         """Atomically takes all events and clears the queue.

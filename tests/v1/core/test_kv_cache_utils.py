@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import importlib
+from types import SimpleNamespace
 from typing import Callable, Optional
 
 import pytest
 import torch
 
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 from vllm.sampling_params import SamplingParams
 from vllm.utils import GiB_bytes, sha256, sha256_cbor_64bit
@@ -15,12 +16,14 @@ from vllm.v1.core.kv_cache_manager import KVCacheManager
 # yapf: disable
 from vllm.v1.core.kv_cache_utils import (
     FreeKVCacheBlockQueue, KVCacheBlock, PrefixCachingMetrics,
+    _get_kv_cache_config_uniform_type,
     estimate_max_model_len, generate_block_hash_extra_keys,
     get_kv_cache_config, get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher, hash_block_tokens, init_none_hash,
     is_kv_cache_type_uniform, unify_kv_cache_configs)
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, KVCacheTensor,
+                                        SegmentedFullAttentionSpec,
                                         SlidingWindowSpec)
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
@@ -84,6 +87,20 @@ def new_sliding_window_spec(block_size=16,
                              sliding_window=sliding_window)
 
 
+def new_segmented_kv_cache_spec(block_size=16,
+                                num_kv_heads=2,
+                                head_size=64,
+                                dtype=torch.float32,
+                                use_mla=False,
+                                segment_size=16):
+    return SegmentedFullAttentionSpec(block_size=block_size,
+                                      num_kv_heads=num_kv_heads,
+                                      head_size=head_size,
+                                      dtype=dtype,
+                                      use_mla=use_mla,
+                                      segment_size=segment_size)
+
+
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor_64bit, hash])
 def test_none_hash(monkeypatch, hash_fn):
     import vllm.v1.core.kv_cache_utils
@@ -130,6 +147,33 @@ def test_kv_cache_block():
 
     block.reset_hash()
     assert block.block_hash is None
+
+
+def test_get_kv_cache_config_uniform_type_dynamic_initial_blocks():
+    cache_config = CacheConfig(block_size=16,
+                               enable_vmm_dynamic=True,
+                               num_blocks_per_seg=8,
+                               init_num_segs=2)
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(max_model_len=128),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
+    )
+    kv_cache_spec = {
+        "layer_1": new_segmented_kv_cache_spec(segment_size=8),
+        "layer_2": new_segmented_kv_cache_spec(segment_size=8),
+    }
+    page_size = next(iter(kv_cache_spec.values())).page_size_bytes
+    available_memory = page_size * 2 * 64
+
+    kv_cache_config = _get_kv_cache_config_uniform_type(vllm_config,
+                                                        kv_cache_spec,
+                                                        available_memory)
+
+    assert kv_cache_config.is_vmm_dynamic is True
+    assert kv_cache_config.num_blocks == 16
+    assert kv_cache_config.max_num_blocks == 64
+    assert kv_cache_config.num_blocks_per_seg == 8
 
 
 def test_free_kv_cache_block_queue_initialization():

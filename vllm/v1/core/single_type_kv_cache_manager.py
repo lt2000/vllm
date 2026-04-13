@@ -9,7 +9,9 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.kv_cache_interface import (ChunkedLocalAttentionSpec,
                                         FullAttentionSpec, KVCacheSpec,
-                                        MambaSpec, SlidingWindowSpec)
+                                        MambaSpec,
+                                        SegmentedFullAttentionSpec,
+                                        SlidingWindowSpec)
 from vllm.v1.request import Request
 
 
@@ -552,11 +554,106 @@ class MambaManager(SingleTypeKVCacheManager):
         return new_blocks
 
 
+class SegmentedFullAttentionManager(FullAttentionManager):
+
+    def __init__(
+        self,
+        kv_cache_spec: SegmentedFullAttentionSpec,
+        block_pool: BlockPool,
+        num_segments: int = 1,
+        segment_sizes: list[int] | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(kv_cache_spec, block_pool, **kwargs)
+        self.num_segments = num_segments
+        self.init_num_segments = num_segments
+        self.num_blocks = self.block_pool.get_num_blocks()
+        if segment_sizes is None:
+            segment_sizes = [self.num_blocks]
+        self.free_blocks_in_segment: dict[int, int] = {
+            seg_id: size
+            for seg_id, size in enumerate(segment_sizes)
+        }
+        self.segment_to_blocks: dict[int, tuple[int, int]] = {}
+        start_block = 0
+        for seg_id, size in enumerate(segment_sizes):
+            self.segment_to_blocks[seg_id] = (start_block,
+                                              start_block + size - 1)
+            start_block += size
+
+    def segment_volume(self, seg_id: int) -> int:
+        start_block, end_block = self.segment_to_blocks[seg_id]
+        return end_block - start_block + 1
+
+    def get_num_segs(self) -> int:
+        return self.num_segments
+
+    def add_segs(self, num_segs: int, seg_size: int) -> None:
+        for _ in range(num_segs):
+            new_seg_id = self.num_segments
+            self.block_pool.add_segment(new_seg_id, seg_size)
+            self.segment_to_blocks[new_seg_id] = (self.num_blocks,
+                                                  self.num_blocks + seg_size -
+                                                  1)
+            self.free_blocks_in_segment[new_seg_id] = seg_size
+            self.num_blocks += seg_size
+            self.num_segments += 1
+
+    def remove_segs(self, num_segs: int) -> None:
+        for _ in range(num_segs):
+            segment_id = self.num_segments - 1
+            segment_size = self.segment_volume(segment_id)
+            self.block_pool.remove_segment(segment_id, segment_size)
+            self.num_blocks -= segment_size
+            self.num_segments -= 1
+            del self.segment_to_blocks[segment_id]
+            del self.free_blocks_in_segment[segment_id]
+
+    def select_free_segs(self, need_free_blocks: int) -> tuple[list[int], int]:
+        selected_segs: list[int] = []
+        total_free_blocks = 0
+        for seg_id in range(self.num_segments - 1, self.init_num_segments - 1,
+                            -1):
+            seg_volume = self.segment_volume(seg_id)
+            if self.free_blocks_in_segment[seg_id] != seg_volume:
+                break
+            selected_segs.append(seg_id)
+            total_free_blocks += seg_volume
+            if total_free_blocks >= need_free_blocks:
+                break
+        selected_segs.reverse()
+        return selected_segs, total_free_blocks
+
+    def allocate_new_blocks(self, request_id: str,
+                            num_tokens: int) -> list[KVCacheBlock]:
+        req_blocks = self.req_to_blocks[request_id]
+        num_required_blocks = cdiv(num_tokens, self.block_size)
+        num_new_blocks = num_required_blocks - len(req_blocks)
+        if num_new_blocks <= 0:
+            return []
+        new_blocks = self.block_pool.get_new_blocks(num_new_blocks,
+                                                    use_segment=True)
+        for block in new_blocks:
+            assert block.segment_id is not None
+            self.free_blocks_in_segment[block.segment_id] -= 1
+        req_blocks.extend(new_blocks)
+        return new_blocks
+
+    def free(self, request_id: str) -> None:
+        req_blocks = self.req_to_blocks.pop(request_id, [])
+        for block in req_blocks:
+            if block.segment_id is not None:
+                self.free_blocks_in_segment[block.segment_id] += 1
+        self.block_pool.free_blocks(reversed(req_blocks), use_segment=True)
+        self.num_cached_block.pop(request_id, None)
+
+
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,
     SlidingWindowSpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
+    SegmentedFullAttentionSpec: SegmentedFullAttentionManager,
 }
 
 

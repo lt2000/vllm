@@ -119,6 +119,27 @@ class CacheConfig:
     necessary for implementating this optimization in some models (e.g. Gemma3n)
     """
 
+    enable_vmm_dynamic: bool = False
+    """Whether to enable dynamic KV cache allocation."""
+
+    num_blocks_per_seg: int = 128
+    """Number of KV cache blocks to allocate or free per segment."""
+
+    init_num_segs: int = 1
+    """Initial number of KV cache segments to make active at startup."""
+
+    gpu_cache_high_threshold: float = 0.9
+    """High watermark for requesting more KV cache segments."""
+
+    gpu_cache_low_threshold: float = 0.75
+    """Low watermark for releasing free KV cache segments."""
+
+    max_gpu_blocks: int = 0
+    """Upper bound for total active GPU KV cache blocks in dynamic mode.
+
+    A value of 0 means the runtime should derive the bound from profiling.
+    """
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -166,6 +187,17 @@ class CacheConfig:
             logger.warning_once(
                 "--kv-sharing-fast-prefill is currently work in progress "
                 "and not functional yet (i.e. no prefill savings)")
+
+        if self.enable_vmm_dynamic:
+            if self.num_blocks_per_seg <= 0:
+                raise ValueError("num_blocks_per_seg must be > 0")
+            if self.init_num_segs <= 0:
+                raise ValueError("init_num_segs must be > 0")
+            if not 0 < self.gpu_cache_low_threshold < \
+                    self.gpu_cache_high_threshold < 1:
+                raise ValueError("Require 0 < low < high < 1")
+            if self.max_gpu_blocks < 0:
+                raise ValueError("max_gpu_blocks must be >= 0")
 
         return self
 

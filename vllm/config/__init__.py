@@ -470,6 +470,8 @@ class ModelConfig:
     logits_processors: Optional[list[Union[str, type[LogitsProcessor]]]] = None
     """One or more logits processors' fully-qualified class names or class
     definitions"""
+    mem_manager_client_id: int = 0
+    """Logical instance id used to select the dynamic KV mem_manager queue."""
 
     def compute_hash(self) -> str:
         """

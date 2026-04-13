@@ -4,6 +4,7 @@
 import dataclasses
 import gc
 import itertools
+import math
 import time
 from collections import defaultdict
 from collections.abc import Iterator
@@ -51,7 +52,7 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors, PoolerOutput
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
-                        GiB_bytes, LazyLoader, cdiv, check_use_alibi,
+                        GiB_bytes, LazyLoader, LayerBlockType, cdiv, check_use_alibi,
                         get_dtype_size, is_pin_memory_available, round_up,
                         supports_dynamo)
 from vllm.v1.attention.backends.mamba_selectors import get_mamba_attn_backend
@@ -64,6 +65,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         ChunkedLocalAttentionSpec,
                                         FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MambaSpec,
+                                        SegmentedFullAttentionSpec,
                                         SlidingWindowSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
                              ModelRunnerOutput)
@@ -98,6 +100,7 @@ else:
         "xgrammar.kernels.apply_token_bitmask_inplace_torch_compile")
 
 logger = init_logger(__name__)
+ALIGNMENT = 2 * 1024 * 1024
 
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
@@ -347,6 +350,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else None)
 
         self.reorder_batch_threshold: Optional[int] = None
+        self.elastic_allocator = None
+        self.num_seg = 0
+        self.num_blocks = 0
+        self.seg_size_list: list[int] = []
+        self.total_memory = (
+            torch.cuda.get_device_properties(self.device).total_memory
+            if self.device.type == "cuda" else 0)
 
     def _init_model_kwargs(self, num_tokens: int):
         model_kwargs = dict[str, Any]()
@@ -3146,8 +3156,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
-        # Initialize the memory buffer for KV cache
-        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        if kv_cache_config.is_vmm_dynamic:
+            kv_cache_raw_tensors = self._allocate_dynamic_kv_cache_tensors(
+                kv_cache_config)
+        else:
+            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(
+                kv_cache_config)
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config,
                                                    kv_cache_raw_tensors)
@@ -3176,6 +3190,56 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                       self.compilation_config.static_forward_context,
                       self.kv_caches)
         return kv_caches
+
+    def _allocate_dynamic_kv_cache_tensors(
+            self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+        try:
+            from vmm_tensor import VMMTensor
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Dynamic KV cache requires the vmm_tensor extension to be "
+                "installed.") from exc
+
+        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        num_attention_layers = self.model_config.get_num_layers_by_block_type(
+            self.parallel_config, LayerBlockType.attention)
+        num_blocks = kv_cache_config.max_num_blocks
+        for kv_cache_spec, group in self._kv_cache_spec_attn_group_iterator():
+            attn_backend = group.backend
+            if not isinstance(kv_cache_spec, AttentionSpec):
+                continue
+            self.kv_cache_shape = attn_backend.get_kv_cache_shape(
+                num_blocks, kv_cache_spec.block_size, kv_cache_spec.num_kv_heads,
+                kv_cache_spec.head_size)
+            self.num_blocks_per_seg = self.cache_config.num_blocks_per_seg
+            self.seg_shape = (self.num_blocks_per_seg,) + self.kv_cache_shape[2:]
+            self.num_seg = self.cache_config.init_num_segs
+            self.num_blocks = self.num_blocks_per_seg * self.num_seg
+            self.seg_size_list = [self.num_blocks_per_seg] * self.num_seg
+
+            reserved_kvcache_align_size, _ = self.get_reserved_size(
+                num_attention_layers, self.kv_cache_shape[2:])
+            total_allocation_size = self.get_allocation_size(
+                num_attention_layers, self.kv_cache_shape[2:], self.num_seg,
+                self.num_blocks_per_seg)
+            self.elastic_allocator = VMMTensor(reserved_kvcache_align_size,
+                                               torch.int8,
+                                               torch.cuda.current_device(),
+                                               num_attention_layers)
+            vmm_raw_tensors = self.elastic_allocator.create_tensors(
+                total_allocation_size,
+                [2 * reserved_kvcache_align_size * ALIGNMENT])
+            for idx, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = vmm_raw_tensors[idx]
+            break
+
+        layer_names = set()
+        for group in kv_cache_config.kv_cache_groups:
+            layer_names.update(group.layer_names)
+        assert layer_names == set(kv_cache_raw_tensors.keys(
+        )), "Some layers are not correctly initialized"
+        return kv_cache_raw_tensors
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -3245,6 +3309,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         dtype=self.kv_cache_dtype,
                         attention_chunk_size=self.attention_chunk_size,
                         use_mla=use_mla)
+                elif self.vllm_config.cache_config.enable_vmm_dynamic:
+                    kv_cache_spec[layer_name] = SegmentedFullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=attn_module.num_kv_heads,
+                        head_size=attn_module.head_size,
+                        dtype=self.kv_cache_dtype,
+                        use_mla=use_mla,
+                        segment_size=self.cache_config.num_blocks_per_seg)
                 else:
                     kv_cache_spec[layer_name] = FullAttentionSpec(
                         block_size=block_size,
@@ -3286,6 +3358,87 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     mamba_type=mamba_module.mamba_type)
 
         return kv_cache_spec
+
+    def align_size(self, shape, dtype, seg_num=1):
+        element_num = np.prod(shape)
+        vmm_size = seg_num * element_num * dtype.itemsize
+        return (vmm_size + ALIGNMENT - 1) // ALIGNMENT
+
+    def get_offset_and_aligned_size(self, seg_shape, seg_dtype, seg_idx):
+        last_seg_idx = seg_idx - 1
+        if last_seg_idx == 0:
+            return 0, self.align_size(seg_shape, seg_dtype, seg_idx)
+        last_aligned = self.align_size(seg_shape, seg_dtype, last_seg_idx)
+        current_aligned = self.align_size(seg_shape, seg_dtype, seg_idx)
+        return last_aligned * ALIGNMENT, current_aligned - last_aligned
+
+    def block_align_size(self, block_shape, dtype, num_current):
+        element_num = np.prod(block_shape)
+        vmm_size = num_current * element_num * dtype.itemsize
+        return (vmm_size + ALIGNMENT - 1) // ALIGNMENT
+
+    def block_get_offset_and_aligned_size(self, block_shape, dtype,
+                                          num_new_block, num_current):
+        if num_current == 0:
+            return 0, self.block_align_size(block_shape, dtype, num_new_block)
+        last_aligned = self.block_align_size(block_shape, dtype, num_current)
+        current_aligned = self.block_align_size(block_shape, dtype,
+                                                num_current + num_new_block)
+        return last_aligned * ALIGNMENT, current_aligned - last_aligned
+
+    def get_reserved_size(self, num_layer: int, block_shape: tuple[int, ...]):
+        total_memory_for_kv = (self.total_memory *
+                               self.cache_config.gpu_memory_utilization)
+        reserved_per_layer = total_memory_for_kv / max(num_layer, 1)
+        block_bytes = np.prod(block_shape) * self.dtype.itemsize
+        raw_num_blocks = reserved_per_layer // block_bytes
+        num_blocks = math.ceil(
+            raw_num_blocks / self.cache_config.num_blocks_per_seg
+        ) * self.cache_config.num_blocks_per_seg
+        kv_cache_shape = (num_blocks,) + block_shape
+        return self.align_size(kv_cache_shape, self.dtype), kv_cache_shape
+
+    def get_allocation_size(self, num_layer: int, block_shape: tuple[int, ...],
+                            num_seg: int, num_blocks_per_seg: int) -> int:
+        allocation_size = 0
+        for seg_idx in range(1, num_seg + 1):
+            seg_shape = (num_blocks_per_seg,) + block_shape
+            _, aligned_size = self.get_offset_and_aligned_size(
+                seg_shape, self.dtype, seg_idx)
+            allocation_size += aligned_size
+        return allocation_size
+
+    def seg_manager_impl(self, seg_delta: int, segment_size: int) -> bool:
+        alloc_plan = []
+        if seg_delta > 0:
+            for _ in range(seg_delta):
+                offset, aligned_size = self.block_get_offset_and_aligned_size(
+                    self.kv_cache_shape[2:], self.dtype, segment_size,
+                    self.num_blocks)
+                self.seg_size_list.append(segment_size)
+                self.num_blocks += segment_size
+                if aligned_size > 0:
+                    alloc_plan.append((offset, aligned_size))
+            if alloc_plan and self.elastic_allocator is not None:
+                self.elastic_allocator.batch_allocate_async(alloc_plan)
+        elif seg_delta < 0:
+            for _ in range(-seg_delta):
+                segment_blocks = self.seg_size_list.pop()
+                offset, aligned_size = self.block_get_offset_and_aligned_size(
+                    self.kv_cache_shape[2:], self.dtype, segment_blocks,
+                    self.num_blocks - segment_blocks)
+                self.num_blocks -= segment_blocks
+                if aligned_size > 0:
+                    alloc_plan.append((offset, aligned_size))
+            if alloc_plan and self.elastic_allocator is not None:
+                self.elastic_allocator.batch_free_async(alloc_plan)
+        self.num_seg += seg_delta
+        return True
+
+    def _seg_manager(self, seg_delta: int, segment_size: int) -> bool:
+        if seg_delta == 0:
+            return True
+        return self.seg_manager_impl(seg_delta, segment_size)
 
     def _build_encoder_only_attn_metadata(
             self, scheduler_output: "SchedulerOutput") -> \

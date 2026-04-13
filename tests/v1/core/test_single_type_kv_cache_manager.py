@@ -9,8 +9,10 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (BlockHash, BlockHashWithGroupId,
                                          KVCacheBlock)
 from vllm.v1.core.single_type_kv_cache_manager import (
-    ChunkedLocalAttentionManager, SlidingWindowManager)
+    ChunkedLocalAttentionManager, SegmentedFullAttentionManager,
+    SlidingWindowManager)
 from vllm.v1.kv_cache_interface import (ChunkedLocalAttentionSpec,
+                                        SegmentedFullAttentionSpec,
                                         SlidingWindowSpec)
 
 
@@ -25,6 +27,32 @@ def get_chunked_local_attention_manager(chunked_local_attention_spec,
     return ChunkedLocalAttentionManager(chunked_local_attention_spec,
                                         block_pool,
                                         kv_cache_group_id=0)
+
+
+def test_segment_manager_selects_only_trailing_free_segments():
+    block_pool = BlockPool(num_gpu_blocks=4,
+                           enable_caching=False,
+                           num_segments=1,
+                           segment_sizes=[4],
+                           num_max_gpu_blocks=8)
+    attention_spec = SegmentedFullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        use_mla=False,
+        segment_size=2,
+    )
+    manager = SegmentedFullAttentionManager(attention_spec,
+                                           block_pool,
+                                           kv_cache_group_id=0,
+                                           num_segments=1,
+                                           segment_sizes=[4])
+
+    manager.add_segs(2, 2)
+    free_seg_list, free_blocks = manager.select_free_segs(need_free_blocks=2)
+    assert free_seg_list == [2]
+    assert free_blocks == 2
 
 
 def test_chunked_local_attention_possible_cached_prefix():

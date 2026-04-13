@@ -286,6 +286,7 @@ class EngineArgs:
     max_model_len: Optional[int] = ModelConfig.max_model_len
     cuda_graph_sizes: list[int] = get_field(SchedulerConfig,
                                             "cuda_graph_sizes")
+    mem_manager_client_id: int = ModelConfig.mem_manager_client_id
     # Note: Specifying a custom executor backend by passing a class
     # is intended for expert use only. The API may change without
     # notice.
@@ -320,6 +321,12 @@ class EngineArgs:
     swap_space: float = CacheConfig.swap_space
     cpu_offload_gb: float = CacheConfig.cpu_offload_gb
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
+    enable_vmm_dynamic: bool = CacheConfig.enable_vmm_dynamic
+    num_blocks_per_seg: int = CacheConfig.num_blocks_per_seg
+    init_num_segs: int = CacheConfig.init_num_segs
+    gpu_cache_high_threshold: float = CacheConfig.gpu_cache_high_threshold
+    gpu_cache_low_threshold: float = CacheConfig.gpu_cache_low_threshold
+    max_gpu_blocks: int = CacheConfig.max_gpu_blocks
     max_num_batched_tokens: Optional[
         int] = SchedulerConfig.max_num_batched_tokens
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
@@ -556,6 +563,11 @@ class EngineArgs:
                                  **model_kwargs["override_attention_dtype"])
         model_group.add_argument("--logits-processors",
                                  **model_kwargs["logits_processors"])
+        model_group.add_argument("--mem-manager-client-id",
+                                 type=int,
+                                 default=ModelConfig.mem_manager_client_id,
+                                 help=("Logical instance id used to select the "
+                                       "dynamic KV mem_manager queue."))
 
         # Model loading arguments
         load_kwargs = get_kwargs(LoadConfig)
@@ -707,6 +719,18 @@ class EngineArgs:
                                  **cache_kwargs["mamba_cache_dtype"])
         cache_group.add_argument("--mamba-ssm-cache-dtype",
                                  **cache_kwargs["mamba_ssm_cache_dtype"])
+        cache_group.add_argument("--enable-vmm-dynamic",
+                                 **cache_kwargs["enable_vmm_dynamic"])
+        cache_group.add_argument("--num-blocks-per-seg",
+                                 **cache_kwargs["num_blocks_per_seg"])
+        cache_group.add_argument("--init-num-segs",
+                                 **cache_kwargs["init_num_segs"])
+        cache_group.add_argument("--gpu-cache-high-threshold",
+                                 **cache_kwargs["gpu_cache_high_threshold"])
+        cache_group.add_argument("--gpu-cache-low-threshold",
+                                 **cache_kwargs["gpu_cache_low_threshold"])
+        cache_group.add_argument("--max-gpu-blocks",
+                                 **cache_kwargs["max_gpu_blocks"])
 
         # Multimodal related configs
         multimodal_kwargs = get_kwargs(MultiModalConfig)
@@ -948,6 +972,7 @@ class EngineArgs:
             model_impl=self.model_impl,
             override_attention_dtype=self.override_attention_dtype,
             logits_processors=self.logits_processors,
+            mem_manager_client_id=self.mem_manager_client_id,
         )
 
     def validate_tensorizer_args(self):
@@ -1121,6 +1146,12 @@ class EngineArgs:
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
+            enable_vmm_dynamic=self.enable_vmm_dynamic,
+            num_blocks_per_seg=self.num_blocks_per_seg,
+            init_num_segs=self.init_num_segs,
+            gpu_cache_high_threshold=self.gpu_cache_high_threshold,
+            gpu_cache_low_threshold=self.gpu_cache_low_threshold,
+            max_gpu_blocks=self.max_gpu_blocks,
         )
 
         ray_runtime_env = None

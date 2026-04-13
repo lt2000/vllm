@@ -362,3 +362,29 @@ class KVCacheManager:
         """Creates a new KVCacheBlocks instance with no blocks."""
         return KVCacheBlocks(tuple([]
                                    for _ in range(self.num_kv_cache_groups)))
+
+    def get_num_blocks(self) -> int:
+        return self.block_pool.get_num_blocks()
+
+    def get_num_free_blocks(self) -> int:
+        return self.block_pool.get_num_free_blocks()
+
+    def get_num_segs(self) -> int:
+        return self.coordinator.get_num_segs()
+
+    def get_num_total_gpu_blocks(self) -> int:
+        return self.block_pool.get_num_total_gpu_blocks()
+
+    def add_segs(self, num_segs: int, seg_size: int) -> None:
+        self.coordinator.add_segs(num_segs, seg_size)
+
+    def remove_segs(self, num_segs: int) -> None:
+        self.coordinator.remove_segs(num_segs)
+
+    def select_free_segs(self, need_free_blocks: int) -> tuple[list[int], int]:
+        return self.coordinator.select_free_segs(need_free_blocks)
+
+    def get_actual_segments(self, segments_delta: int) -> tuple[int, int]:
+        if not self.kv_cache_config.is_vmm_dynamic:
+            return 0, 0
+        return segments_delta, self.kv_cache_config.num_blocks_per_seg

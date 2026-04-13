@@ -167,6 +167,11 @@ class MultiprocExecutor(Executor):
         scheduler_output,
     ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
         non_block = self.max_concurrent_batches > 1
+        if self.vllm_config.cache_config.enable_vmm_dynamic:
+            self.collective_rpc("seg_manager",
+                                args=(scheduler_output.num_new_segs,
+                                      scheduler_output.num_block_per_seg),
+                                non_block=False)
 
         if not self.has_connector:
             # get output only from a single worker (output_rank)

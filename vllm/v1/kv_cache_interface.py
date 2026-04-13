@@ -203,6 +203,11 @@ class MambaSpec(KVCacheSpec):
         return self.page_size_bytes
 
 
+@dataclass(frozen=True)
+class SegmentedFullAttentionSpec(FullAttentionSpec):
+    segment_size: int = 128
+
+
 @dataclass
 class KVCacheTensor:
     """
@@ -241,3 +246,6 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
     kv_cache_groups: list[KVCacheGroupSpec]
+    is_vmm_dynamic: bool = False
+    max_num_blocks: int = 0
+    num_blocks_per_seg: int = 0

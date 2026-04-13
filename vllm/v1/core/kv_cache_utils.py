@@ -14,7 +14,9 @@ from vllm.utils import GiB_bytes, cdiv, sha256_cbor_64bit
 from vllm.v1.kv_cache_interface import (ChunkedLocalAttentionSpec,
                                         FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, KVCacheSpec,
-                                        KVCacheTensor, SlidingWindowSpec)
+                                        KVCacheTensor,
+                                        SegmentedFullAttentionSpec,
+                                        SlidingWindowSpec)
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
@@ -153,6 +155,8 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # Segment id for dynamic KV cache allocation.
+    segment_id: Optional[int] = None
 
     @property
     def block_hash(self) -> Optional[BlockHashWithGroupId]:
@@ -823,8 +827,15 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     """
 
     page_size = get_uniform_page_size(kv_cache_spec)
-    num_blocks = get_num_blocks(vllm_config, len(kv_cache_spec),
-                                available_memory, page_size)
+    if vllm_config.cache_config.enable_vmm_dynamic:
+        num_blocks = (vllm_config.cache_config.num_blocks_per_seg *
+                      vllm_config.cache_config.init_num_segs)
+        max_num_blocks = get_num_blocks(vllm_config, len(kv_cache_spec),
+                                        available_memory, page_size)
+    else:
+        num_blocks = get_num_blocks(vllm_config, len(kv_cache_spec),
+                                    available_memory, page_size)
+        max_num_blocks = num_blocks
 
     per_layer_size = page_size * num_blocks
     # All layers have the same KV cache spec, so we create one kv cache group
@@ -842,6 +853,10 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=create_kv_cache_group_specs(kv_cache_spec,
                                                     grouped_layer_names),
+        is_vmm_dynamic=vllm_config.cache_config.enable_vmm_dynamic,
+        max_num_blocks=max_num_blocks,
+        num_blocks_per_seg=vllm_config.cache_config.num_blocks_per_seg
+        if vllm_config.cache_config.enable_vmm_dynamic else 0,
     )
 
     num_tokens = num_blocks * vllm_config.cache_config.block_size

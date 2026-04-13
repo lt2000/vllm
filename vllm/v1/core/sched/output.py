@@ -155,3 +155,7 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+    # Dynamic KV cache segment delta for this scheduling step.
+    num_new_segs: int = 0
+    # Number of blocks in each scheduled segment operation.
+    num_block_per_seg: int = 0

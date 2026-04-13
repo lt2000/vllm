@@ -79,3 +79,48 @@ def test_defaults_with_usage_context():
         UsageContext.OPENAI_API_SERVER)
     assert vllm_config.scheduler_config.max_num_seqs == default_max_num_seqs
     assert vllm_config.scheduler_config.max_num_batched_tokens == default_server_tokens  # noqa: E501
+
+
+def test_dynamic_kv_flags_from_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args([
+        "--enable-vmm-dynamic",
+        "--num-blocks-per-seg",
+        "128",
+        "--init-num-segs",
+        "2",
+        "--gpu-cache-high-threshold",
+        "0.92",
+        "--gpu-cache-low-threshold",
+        "0.71",
+        "--max-gpu-blocks",
+        "4096",
+        "--mem-manager-client-id",
+        "3",
+    ])
+    engine_args = EngineArgs.from_cli_args(args=args)
+
+    assert engine_args.enable_vmm_dynamic is True
+    assert engine_args.num_blocks_per_seg == 128
+    assert engine_args.init_num_segs == 2
+    assert engine_args.gpu_cache_high_threshold == pytest.approx(0.92)
+    assert engine_args.gpu_cache_low_threshold == pytest.approx(0.71)
+    assert engine_args.max_gpu_blocks == 4096
+    assert engine_args.mem_manager_client_id == 3
+
+
+def test_create_model_config_forwards_mem_manager_client_id(monkeypatch):
+    captured = {}
+
+    class FakeModelConfig:
+
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("vllm.engine.arg_utils.ModelConfig", FakeModelConfig)
+
+    engine_args = EngineArgs(model="facebook/opt-125m",
+                             mem_manager_client_id=7)
+    engine_args.create_model_config()
+
+    assert captured["mem_manager_client_id"] == 7
